@@ -7,6 +7,7 @@ from datetime import datetime
 import hmac
 import socket
 import ssl
+import time
 
 """
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -17,9 +18,13 @@ from cryptography.hazmat.backends import default_backend
 """
 
 
-class SimpleTCPClient():
+class SimpleTCPClient:
+    """
+    Simple TCP Client Implementation
+    """
     def __init__(self, host: str, port: int, use_ssl: bool = False):
         self._client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._client_socket.settimeout(5.0)
         self._host = host
         self._port = port
 
@@ -30,16 +35,28 @@ class SimpleTCPClient():
 
     def _send(self, payload: bytes):
         self._client_socket.connect((self._host, self._port))
-
         self._client_socket.sendall(payload)
+        self._client_socket.setblocking(0)
+        print(payload.decode('utf8'))
 
         parts = []
         while True:
-            parts.append(self._client_socket.recv(1024 << 10))
-            if not parts[len(parts) - 1]:
+            try:
+                r = self._client_socket.recv(1024)
+                parts.append(r)
+                if not parts[len(parts) - 1]:
+                    break
+            except BlockingIOError:
+                # No data available to read, wait or perform other tasks
+                # print("No data available yet, continuing...")
+                if parts:
+                    break
+                time.sleep(0.1)  # Sleep for a while before trying again
+            except socket.error as e:
+                print(f"Socket error: {e}")
                 break
+
         self._client_socket.close()
-        parts.pop()  # Consume a last empty part
         return b''.join(parts)
 
     def __call__(self, payload: bytes) -> bytes:
@@ -47,12 +64,15 @@ class SimpleTCPClient():
 
 
 class SimpleRESTClient(SimpleTCPClient):
-    def __init__(self, url: str):
+    """
+    Simple REST API Client Implementation
+    """
+    def __init__(self, method: str, url: str, headers: dict = None,
+                 body: bytes = b'') -> bytes:
         parsed_url = urlparse(url)
         parsed_netloc = parsed_url.netloc.split(':')
-
-        if len(parsed_netloc) == 2:
-            port = parsed_netloc[1]
+        if len(parsed_netloc) == 2:  # port specified
+            port = int(parsed_netloc[1])
         elif parsed_url.scheme in ('http', ''):
             port = 80
         elif parsed_url.scheme == 'https':
@@ -60,111 +80,169 @@ class SimpleRESTClient(SimpleTCPClient):
         else:
             raise ValueError('Unrecognized scheme')
 
-        host = parsed_netloc[0]
-        self._uri = parsed_url.path if parsed_url.path else '/'
-        if parsed_url.query:
-            self._uri += '?' + parsed_url.query
+        self._method = method
+        self._path = parsed_url.path if parsed_url.path else '/'
+        self._query = parsed_url.query
+        self._headers = headers
+        self._body = bytearray(body)
 
-        SimpleTCPClient.__init__(self, host, port)
+        SimpleTCPClient.__init__(self, parsed_netloc[0], port)
 
-    def __call__(self, method: str = 'GET', headers: dict = None,
-                 body: bytes = b'') -> bytes:
-        payload = '\n'.join(
-            [
-                f'{method} {self._uri} HTTP/1.1',
-                f'Host: {self._host}',
-            ]
-        )
+    def __call__(self, **kwargs):
+        return self._send(self._get_payload())
 
-        headers = {k.lower().title(): v for k, v in (headers.items()
-                                                     if headers else {})}
-        if 'Accept' not in headers:
-            headers['Accept'] = '*/*'
+    @property
+    def headers(self):
+        return {k.lower(): v for k, v in (
+            self._headers.items() if self._headers else {})}
 
-        payload = (
+    @property
+    def query_strings(self):
+        return self._query
+
+    def _get_payload(self) -> bytes:
+        uri = (
+            '?'.join([self._path, self.query_strings]) if self.query_strings
+            else self._path)
+
+        payload = f'{self._method} {uri} HTTP/1.1'
+
+        return (
             '\n'.join(
                 [
                     payload,
-                    '\n'.join(
-                        [
-                            f'{k}:{v}' for k, v in headers.items()
-                        ]
-                    ),
+                    '\n'.join([f'{k}:{v}' for k, v in self.headers.items()]),
                     '', ''
                 ]
             )
-        ).encode('utf8') + body
-
-        return self._send(payload)
+        ).encode('utf8') + self._body
 
 
-class StreamingUpload(SimpleRESTClient):
-    def __call__(self, body: bytes, headers: dict = None) -> bytes:
-        pass
+class AmzSigV4Request(SimpleRESTClient):
+    def __init__(self, method: str, url: str, headers: dict = None,
+                 body: bytes = b'', algorithm: str = None, region: str = None,
+                 access_key: str = None, secret_access_key: str = None,
+                 has_trailer: bool = False, is_streaming: bool = False):
+        SimpleRESTClient.__init__(self, method, url, headers, body)
+
+        self._auth_header = AuthoHeader(http_verb=self._method,
+                                        uri=self._path,
+                                        host=self._host,
+                                        algorithm=algorithm,
+                                        region=region,
+                                        access_key=access_key,
+                                        secret_access_key=secret_access_key,
+                                        headers=headers,
+                                        query_strings=self._query,
+                                        has_trailer=has_trailer,
+                                        is_streaming=is_streaming)
+
+    @property
+    def headers(self):
+        headers = self._auth_header.headers
+        headers['Authorization'] = self._auth_header.Authorization
+        return headers
 
 
-class AuthHeader():
+class AuthoHeader():
     def __init__(self, http_verb: str, uri: str, algorithm: str, region: str,
                  access_key: str, secret_access_key: str, headers: dict = None,
-                 query_strings: dict = None, has_trailer: bool = False):
+                 query_strings: str = None, has_trailer: bool = False,
+                 is_streaming: bool = False, host: str = None,
+                 body: bytearray = b''):
+        self._http_verb = http_verb
+        self._uri = uri
         self._access_key = access_key
         self._secret_access_key = secret_access_key
         self._region = region
         self._algorithm = algorithm
         self._has_trailer = has_trailer
+        self._is_streaming = is_streaming
+        self._body = body
         self._utcnow = datetime.utcnow()
+        self.query_strings = query_strings
         self.headers = headers
-        query_strings = query_strings if query_strings else {}
-
-        self._canonical_request = (
-            '\n'.join(
-                [
-                    # HTTP Verb
-                    http_verb,
-                    # Canonical URI
-                    quote(uri),
-                    # Canonical Query String
-                    '&'.join(
-                        [f'{quote(k)}={quote(v)}'
-                         for k, v in query_strings.items()]),
-                    # Canonical Headers
-                    '\n'.join(
-                        [f'{k.lower()}:{v.strip()}'
-                         for k, v in self._headers.items()]),
-                    # Signed Headers
-                    ';'.join([list(self.headers)]),
-                    # x-amz-content-sha256
-                    self.x_amz_content_sha256]))
 
     @property
-    def headers(self):
-        return self._headers
+    def canonical_request(self):
+        canonical_request = '\n'.join(
+            [
+                # HTTP Verb
+                self._http_verb,
+                # Canonical URI
+                self.canonical_uri,
+                # Canonical Query String
+                self.query_strings,
+                # Canonical Headers
+                self.canonical_headers,
+                '',
+                # Signed Headers
+                self.signed_headers,
+                # x-amz-content-sha256
+                self.x_amz_content_sha256])
+        return canonical_request
+
+    @property
+    def canonical_uri(self):
+        return quote(self._uri)
+
+    @property
+    def query_strings(self):
+        return self._canonical_query_strings
+
+    @query_strings.setter
+    def query_strings(self, query_strings):
+        if not query_strings:
+            self._canonical_query_strings = ''
+        else:
+            parsed_query_strings = {
+                quote(k): quote(v)
+                for item in query_strings.split('&')
+                for k, v in item.split('=')}
+            sorted_keys = sorted(parsed_query_strings)
+            self._canonical_query_strings = '&'.join(
+                [f'{k}={parsed_query_strings[k]}' for k in sorted_keys])
+
+    @property
+    def headers(self) -> dict:
+        return self._headers.copy()
 
     @headers.setter
     def headers(self, headers: dict):
-        self._headers = {k.lower: v for k, v in headers.items()}
-        if 'x-amz-date' not in self._headers:
-            self._headers['x-amz_date'] = self.amz_date
-        if 'x-amz-content-sha256' not in self._headers:
-            self._headers['x-amz-content-sha256'] = self.x_amz_content_sha256
-        sorted_keys = sorted(self._headers)
-        self._headers = {
-            k: (
-                self._headers[k].strip() if self._headers[k] else '')
-            for k in sorted_keys}
+        parsed_headers = {
+            quote(k.lower()): quote(v) for k, v in headers.items()}
+        if 'x-amz-date' not in parsed_headers:
+            parsed_headers['x-amz_date'] = self.amz_date
+        if 'x-amz-content-sha256' not in parsed_headers:
+            parsed_headers['x-amz-content-sha256'] = self.x_amz_content_sha256
+        if 'host' not in headers:
+            headers['host'] = self._host
+
+        sorted_keys = sorted(parsed_headers)
+        self._headers = {k: parsed_headers[k] for k in sorted_keys}
+
+    @property
+    def canonical_headers(self):
+        return '\n'.join([f'{k}:{v.strip()}' for k, v in self.headers.items()])
+
+    @property
+    def signed_headers(self):
+        return ';'.join(list(self.headers))
 
     @property
     def x_amz_content_sha256(self):
-        return (f'STREAMING-{self._algorithm}-PAYLOAD' +
-                '-TRAILER' if self._has_trailer else '')
+        if self._is_streaming:
+            return (f'STREAMING-{self._algorithm}-PAYLOAD' +
+                    '-TRAILER' if self._has_trailer else '')
+        return sha256(self._body).hexdigest()
 
     @property
     def date(self):
-        return self._utcnow.strftime('%Y%m%d'),
+        return self._utcnow.strftime('%Y%m%d')
 
     @property
     def amz_date(self):
-        return self._utcnow.isoformat()  # yyyymmddThhmmssZ
+        return self._utcnow.strftime('%Y%m%dT%H%M%SZ')  # yyyymmddThhmmssZ
 
     @property
     def scope(self):
@@ -182,7 +260,7 @@ class AuthHeader():
                 self._algorithm,
                 self.amz_date,
                 self.scope,
-                sha256(self._canonical_request.encode('utf8')).hexdigest()])
+                sha256(self.canonical_request.encode('utf8')).hexdigest()])
 
     @property
     def signing_key(self):
@@ -211,5 +289,5 @@ class AuthHeader():
             f'{self._algorithm} '
             f'Credential={self._access_key}/{self.date}/{self._region}/'
             f's3/aws4_request,'
-            f'SignedHeaders={self._signed_headers}',
+            f'SignedHeaders={self.signed_headers},'
             f'Signature={self.seed_signature.hexdigest()}')
